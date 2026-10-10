@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# rfctl - run and manage the RF Online: Golden Age (rf2232) Docker stack.
+# Run "./rfctl help" for the command list.
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+# --------------------------------------------------------------- helpers ---
+c_b=$'\e[1m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_0=$'\e[0m'
+[ -t 1 ] || { c_b=; c_g=; c_y=; c_r=; c_0=; }
+say()  { printf '%s==>%s %s\n' "$c_b$c_g" "$c_0" "$*"; }
+warn() { printf '%sWARNING:%s %s\n' "$c_y" "$c_0" "$*" >&2; }
+die()  { printf '%sERROR:%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
+
+if [ ! -f .env ]; then
+  cp .env.example .env
+  sed -i "s/^RF_UID=.*/RF_UID=$(id -u)/; s/^RF_GID=.*/RF_GID=$(id -g)/" .env
+  say "created .env from .env.example (review it, especially passwords and RF_PUBLIC_HOST)"
+fi
+
+# cfg KEY [default] - value from the environment, else .env, else default.
+cfg() {
+  local key=$1 def=${2:-} line val
+  if [ -n "${!key+x}" ]; then printf '%s' "${!key}"; return; fi
+  line=$(grep -E "^[[:space:]]*${key}=" .env 2>/dev/null | tail -1 || true)
+  if [ -z "$line" ]; then printf '%s' "$def"; return; fi
+  val=${line#*=}
+  val=${val%$'\r'}
+  case "$val" in \"*\") val=${val:1:-1};; \'*\') val=${val:1:-1};; esac
+  printf '%s' "${val:-$def}"
+}
+
+PROVIDER=$(cfg RF_DB_PROVIDER sqlite)
+BUNDLED=$(cfg RF_MYSQL_BUNDLED 1)
+DATA_DIR=$(cfg RF_DATA_DIR ./data)
+BUNDLE_DIR=$(cfg RF_BUNDLE_DIR ../rf2232-v0.6.0)
+TLS_DOMAIN=$(cfg RF_TLS_DOMAIN)
+START_TIMEOUT=$(cfg RF_START_TIMEOUT 900)
+
+# The gameserver always opens its launcher port at SERVICE_PORT + 1.
+RF_LAUNCHER_PORT=$(( $(cfg RF_SERVICE_PORT 27800) + 1 )); export RF_LAUNCHER_PORT
+
+COMPOSE=(docker compose -f docker-compose.yml)
+[ -n "$TLS_DOMAIN" ] && COMPOSE+=(-f docker-compose.tls.yml)
+use_mysql_container() { [ "$PROVIDER" = mysql ] && [ "$BUNDLED" = 1 ]; }
+use_mysql_container && COMPOSE+=(--profile mysql)
+
+dc()    { "${COMPOSE[@]}" "$@"; }
+tools() { "${COMPOSE[@]}" --progress quiet run --rm -T --no-deps init "$@"; }   # one-off tools container
+cid()   { dc ps -q "$1" 2>/dev/null; }
+running() { [ -n "$(dc ps -q --status running "$1" 2>/dev/null)" ]; }
+
+confirm() {
+  [ "${ASSUME_YES:-0}" = 1 ] && return 0
+  local a; read -r -p "$1 [y/N] " a; [[ "$a" =~ ^[Yy] ]]
+}
+
+preflight() {
+  command -v docker >/dev/null || die "docker is not installed"
+  docker compose version >/dev/null 2>&1 || die "the docker compose plugin is required"
+  case "$PROVIDER" in sqlite|mysql) ;; *) die "RF_DB_PROVIDER must be sqlite or mysql (got '$PROVIDER')";; esac
+  local pw; pw=$(cfg RF_DB_PASSWORD)
+  if [ "$PROVIDER" = mysql ]; then
+    [[ "$pw" =~ [[:space:]] ]] && die "RF_DB_PASSWORD must not contain whitespace"
+    [[ "$pw" == *"#"* || "$pw" == *"//"* ]] && die "RF_DB_PASSWORD must not contain '#' or '//' (settings.cfg treats them as comments)"
+    [ "$pw" = CHANGEME ] && warn "RF_DB_PASSWORD is still CHANGEME"
+    if use_mysql_container && [ -z "$(cfg RF_DB_ROOT_PASSWORD)" ]; then
+      die "the bundled MySQL needs RF_DB_ROOT_PASSWORD in .env"
+    fi
+  fi
+  mkdir -p "$DATA_DIR"/{settings,db,logs,backups,webassets,client,custom}
+}
+
+need_images() {
+  local prefix tag t missing=0
+  prefix=$(cfg RF_IMAGE_PREFIX rf2232); tag=$(cfg RF_IMAGE_TAG 0.7.0)
+  for t in gameserver webserver tools; do
+    docker image inspect "$prefix-$t:$tag" >/dev/null 2>&1 || missing=1
+  done
+  if [ $missing = 1 ]; then
+    [ -x "$BUNDLE_DIR/server/linux/gameserver" ] || die "images not built and no server bundle at RF_BUNDLE_DIR=$BUNDLE_DIR"
+    say "building images from $BUNDLE_DIR"
+    dc build
+  fi
+}
+
+# Wait until the gameserver logs "gameserver started" (or fails).
+wait_gameserver() {
+  local since=$1 id t=0 logs
+  id=$(cid gameserver)
+  [ -n "$id" ] || die "gameserver container not found"
+  say "waiting for the gameserver (timeout ${START_TIMEOUT}s)"
+  while :; do
+    logs=$(docker logs --since "$since" "$id" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' || true)
+    if grep -q 'gameserver started' <<<"$logs"; then
+      grep -E 'provisioned|migrated static game data|static game data|Listen:|Accounts:|Game DB:' <<<"$logs" | sed 's/^/    /' || true
+      say "gameserver is up"
+      return 0
+    fi
+    if grep -q 'FATAL' <<<"$logs"; then
+      grep -A4 'FATAL' <<<"$logs" | head -8 >&2
+      die "the gameserver failed to start (./rfctl logs gameserver)"
+    fi
+    if [ $t = 10 ] && [ "$PROVIDER" = mysql ]; then
+      say "first start on MySQL imports the game content (~2.7M rows) - do not stop it"
+    fi
+    [ "$t" -ge "$START_TIMEOUT" ] && die "gameserver did not report ready within ${START_TIMEOUT}s"
+    sleep 2; t=$((t + 2))
+  done
+}
+
+show_access() {
+  local web_port public sp
+  web_port=$(cfg RF_WEB_PORT 8080); public=$(cfg RF_PUBLIC_HOST 127.0.0.1)
+  echo
+  if [ -n "$TLS_DOMAIN" ]; then
+    echo "  Website / control panel : https://$TLS_DOMAIN/"
+  else
+    echo "  Website / control panel : http://$public:$web_port/"
+  fi
+  echo "  Game client socket      : $public:$(cfg RF_SERVICE_PORT 27800)  (launcher: $RF_LAUNCHER_PORT)"
+  sp=$(awk '$1=="SUPER_PASSWORD"{print $2}' "$DATA_DIR/settings/settings.cfg" 2>/dev/null || true)
+  if [ -n "$sp" ]; then
+    echo
+    echo "  ${c_y}No administrator yet.${c_0} Sign in at /login/ with YOUR email and this one-time"
+    echo "  password to become Super Administrator:  ${c_b}$sp${c_0}"
+  fi
+  echo
+}
+
+# -------------------------------------------------------------- commands ---
+cmd_up() {
+  preflight
+  need_images
+  if use_mysql_container; then
+    say "starting MySQL"
+    dc up -d --wait mysql
+  elif [ "$PROVIDER" = mysql ]; then
+    say "using external MySQL at $(cfg RF_DB_HOST):$(cfg RF_DB_PORT 3306)"
+  fi
+
+  say "initialising (settings.cfg from .env, content, schema)"
+  local since; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  dc up -d --no-deps --force-recreate init >/dev/null 2>&1
+  local rc; rc=$(docker wait "$(cid init)")
+  dc logs --no-log-prefix init | sed 's/^/    /'
+  [ "$rc" = 0 ] || die "init failed (exit $rc)"
+
+  say "starting the gameserver"
+  local was_running=0
+  running gameserver && was_running=1
+  dc up -d --no-deps gameserver
+  if [ $was_running = 1 ] && [[ "$(docker inspect -f '{{.State.StartedAt}}' "$(cid gameserver)")" < "$since" ]]; then
+    say "gameserver was already running - left as is (use ./rfctl restart to apply .env changes)"
+  else
+    wait_gameserver "$since"
+  fi
+
+  say "starting the webserver and the backup scheduler"
+  dc up -d --no-deps webserver backup
+
+  say "checking the database"
+  if tools check-db 2>/dev/null | sed 's/^/    /'; then :; else
+    warn "database check reported problems (see above)"
+  fi
+  show_access
+}
+
+cmd_down()    { say "stopping the stack (data in $DATA_DIR is kept)"; dc down; }
+cmd_stop()    { say "stopping servers"; dc stop webserver backup gameserver; }
+cmd_restart() { cmd_stop; cmd_up; }
+cmd_status()  {
+  dc ps -a
+  echo
+  if running gameserver || [ "$PROVIDER" = sqlite ]; then tools check-db 2>/dev/null || true; fi
+}
+cmd_logs()    { dc logs --tail "${TAIL:-200}" "$@"; }
+cmd_build()   { [ -x "$BUNDLE_DIR/server/linux/gameserver" ] || die "no server bundle at RF_BUNDLE_DIR=$BUNDLE_DIR"; dc build --pull "$@"; }
+cmd_check_db() { tools check-db; }
+cmd_backup()  { preflight; tools backup "${1:-manual}"; }
+cmd_backups() { tools list; }
+cmd_prune()   { tools prune; }
+cmd_shell()   { dc run --rm --no-deps init shell; }
+cmd_super_password() {
+  local sp; sp=$(awk '$1=="SUPER_PASSWORD"{print $2}' "$DATA_DIR/settings/settings.cfg" 2>/dev/null || true)
+  if [ -n "$sp" ]; then echo "$sp"; else echo "(none - an administrator already exists, or the webserver has not started yet)"; fi
+}
+
+# Stop servers, run a tools command, start again (only if they were running).
+with_servers_stopped() {
+  local was_running=0
+  running gameserver && was_running=1
+  if [ $was_running = 1 ]; then say "stopping servers"; dc stop webserver backup gameserver; fi
+  tools "$@"
+  if [ $was_running = 1 ]; then cmd_up; else say "done (servers were not running; start with ./rfctl up)"; fi
+}
+
+cmd_restore() {
+  local name=${1:-}
+  [ -n "$name" ] || { tools list; echo; die "usage: ./rfctl restore <backup-name>"; }
+  [ -d "$DATA_DIR/backups/$name" ] || die "no backup named $name in $DATA_DIR/backups"
+  confirm "Restore $name? Current databases are replaced (a pre-restore backup is taken first)." || exit 1
+  use_mysql_container && dc up -d --wait mysql
+  with_servers_stopped restore "$name"
+}
+
+cmd_reset_gamedata() {
+  confirm "Rebuild the game content database from the stock copy? Game-data editor changes are lost (a backup is taken first)." || exit 1
+  use_mysql_container && dc up -d --wait mysql
+  with_servers_stopped reset-gamedata
+}
+
+cmd_rfassets() {
+  local client=${1:-}
+  [ -n "$client" ] && [ -d "$client" ] || die "usage: ./rfctl rfassets <path-to-your-RF-client-folder>"
+  shift
+  dc run --rm -T --no-deps -v "$(readlink -f "$client"):/client:ro" init rfassets "$@"
+  say "restart the webserver to pick up the art pack: ./rfctl restart"
+}
+
+# Copy the state of a non-Docker install (an unpacked bundle that has been run)
+# into RF_DATA_DIR: SQLite databases, art pack, custom/ overrides, optionally backups.
+cmd_import() {
+  local src=${1:-} with_backups=0
+  [ -n "$src" ] || die "usage: ./rfctl import <bundle-dir> [--with-backups]"
+  [ "${2:-}" = --with-backups ] && with_backups=1
+  [ -d "$src/db" ] || die "$src/db not found"
+  [ "$PROVIDER" = sqlite ] || die "import copies SQLite files; set RF_DB_PROVIDER=sqlite (switching backends is not automatic)"
+  running gameserver && die "stop the stack first: ./rfctl stop"
+  preflight
+  if ls "$DATA_DIR"/db/*.db >/dev/null 2>&1; then
+    confirm "$DATA_DIR/db already has databases. Back them up and replace them with $src/db?" || exit 1
+    tools backup pre-import >/dev/null
+  fi
+  say "copying databases from $src/db"
+  rm -f "$DATA_DIR"/db/*.db-wal "$DATA_DIR"/db/*.db-shm
+  cp -v "$src"/db/*.db "$DATA_DIR/db/"
+  # A server stopped uncleanly can leave its WAL beside the database; keep it with it.
+  cp -v "$src"/db/*.db-wal "$src"/db/*.db-shm "$DATA_DIR/db/" 2>/dev/null || true
+  [ -d "$src/webassets" ] && { say "copying the art pack"; cp -a "$src/webassets/." "$DATA_DIR/webassets/"; }
+  [ -d "$src/custom" ]    && { say "copying custom/";       cp -a "$src/custom/."    "$DATA_DIR/custom/"; }
+  if [ $with_backups = 1 ] && [ -d "$src/backups" ]; then
+    say "copying backups"; cp -a "$src/backups/." "$DATA_DIR/backups/"
+  fi
+  say "import done - start with ./rfctl up"
+}
+
+cmd_help() {
+  cat <<EOF
+rfctl - manage the RF Online: Golden Age (rf2232) Docker stack
+
+Lifecycle
+  up                     build images if needed, init, start everything, verify the DB
+  stop                   stop the servers (containers kept)
+  down                   stop and remove the containers (data is kept)
+  restart                stop + up (apply .env changes this way)
+  status                 containers and database/schema state
+  logs [service] [-f]    logs (services: gameserver webserver backup init mysql)
+  build                  rebuild the images from RF_BUNDLE_DIR
+
+Database
+  check-db               provider, table counts, schema_info / _import_manifest
+  reset-gamedata         rebuild the game content DB from the stock copy
+
+Backups  (stored in $DATA_DIR/backups)
+  backup [label]         take a backup now (safe while running)
+  backups                list backups
+  restore <name>         restore one (servers are stopped and restarted)
+  prune                  rotate automatic backups down to RF_BACKUP_KEEP
+
+Other
+  import <bundle> [--with-backups]   copy data from an existing non-Docker install
+  rfassets <client-dir>  build the website art pack from your RF client
+  super-password         show the one-time control panel bootstrap password
+  shell                  shell in the tools container (sqlite3, mariadb clients)
+
+Set ASSUME_YES=1 to skip confirmations.
+EOF
+}
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  up|start)        cmd_up ;;
+  stop)            cmd_stop ;;
+  down)            cmd_down ;;
+  restart)         cmd_restart ;;
+  status|ps)       cmd_status ;;
+  logs)            cmd_logs "$@" ;;
+  build)           cmd_build "$@" ;;
+  check-db)        cmd_check_db ;;
+  reset-gamedata)  cmd_reset_gamedata ;;
+  backup)          cmd_backup "$@" ;;
+  backups|list)    cmd_backups ;;
+  restore)         cmd_restore "$@" ;;
+  prune)           cmd_prune ;;
+  import)          cmd_import "$@" ;;
+  rfassets)        cmd_rfassets "$@" ;;
+  super-password)  cmd_super_password ;;
+  shell)           cmd_shell ;;
+  help|-h|--help)  cmd_help ;;
+  *)               die "unknown command '$cmd' (./rfctl help)" ;;
+esac

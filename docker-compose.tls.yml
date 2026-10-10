@@ -1,0 +1,17 @@
+# HTTPS overlay, added by rfctl when RF_TLS_DOMAIN is set.
+# The webserver then obtains a Let's Encrypt certificate itself and serves
+# :443, redirecting :80. RF_TLS_DOMAIN must resolve to this host and ports
+# 80/443 must be reachable from the internet.
+services:
+  gameserver:
+    ports:
+      - "${RF_BIND_ADDR:-0.0.0.0}:80:80"
+      - "${RF_BIND_ADDR:-0.0.0.0}:443:443"
+  webserver:
+    # No -http flag: that flag forces plain HTTP and disables TLS.
+    command: ["-serverdir", "/opt/rf2232"]
+    # Keep any certificate cache under a persistent folder (Go's default
+    # cache dir is derived from HOME / XDG_CACHE_HOME).
+    environment:
+      HOME: /opt/rf2232/settings/.home
+      XDG_CACHE_HOME: /opt/rf2232/settings/.home/.cache

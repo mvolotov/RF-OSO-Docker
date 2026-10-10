@@ -1,0 +1,156 @@
+# RF Online: Golden Age (rf2232) - Docker Compose stack.
+# Configure through .env (copy .env.example). Prefer ./rfctl over raw compose:
+# it picks the MySQL profile / TLS overlay and verifies the database after start.
+
+name: ${RF_PROJECT:-rf2232}
+
+x-build: &build
+  context: .
+  additional_contexts:
+    bundle: ${RF_BUNDLE_DIR:-../rf2232-v0.6.0}
+
+# Container stdout is rotated; the gameserver also keeps its own logs/history*.log.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: ${RF_LOG_MAX_SIZE:-20m}
+    max-file: "${RF_LOG_MAX_FILES:-5}"
+
+# Everything init/backup needs to render settings.cfg and reach the database.
+x-rf-env: &rf-env
+  TZ: ${TZ:-UTC}
+  RF_UID: ${RF_UID:-1000}
+  RF_GID: ${RF_GID:-1000}
+  RF_PUBLIC_HOST: ${RF_PUBLIC_HOST:-}
+  RF_LAUNCHER_UPDATE_URL: ${RF_LAUNCHER_UPDATE_URL:-}
+  RF_WEB_PORT: ${RF_WEB_PORT:-8080}
+  RF_DEBUG: ${RF_DEBUG:-0}
+  RF_SERVICE_IP: 0.0.0.0
+  RF_SERVICE_PORT: ${RF_SERVICE_PORT:-27800}
+  RF_MAX_SESSIONS: ${RF_MAX_SESSIONS:-0}
+  RF_ALLOW_SCRIPTED_CLIENTS: ${RF_ALLOW_SCRIPTED_CLIENTS:-1}
+  RF_PROFILE_PORT: ${RF_PROFILE_PORT:-0}
+  RF_DB_PROVIDER: ${RF_DB_PROVIDER:-sqlite}
+  RF_DB_HOST: ${RF_DB_HOST:-mysql}
+  RF_DB_PORT: ${RF_DB_PORT:-3306}
+  RF_DB_USER: ${RF_DB_USER:-rf2232}
+  RF_DB_PASSWORD: ${RF_DB_PASSWORD:-CHANGEME}
+  RF_DB_ROOT_PASSWORD: ${RF_DB_ROOT_PASSWORD:-}
+  RF_DB_ACCOUNTS: ${RF_DB_ACCOUNTS:-gommo_accounts}
+  RF_DB_GAME: ${RF_DB_GAME:-gommo_rf2232}
+  RF_DB_GAMEDATA: ${RF_DB_GAMEDATA:-gamedata_rf2232}
+  RF_GAMEDATA_MODE: ${RF_GAMEDATA_MODE:-default}
+  RF_LEGACY_PATH: ${RF_LEGACY_PATH:-gamedata-legacy}
+  RF_CLIENT_PATH: ${RF_CLIENT_PATH:-gamedata-client}
+  RF_LEGACY_ZONES: ${RF_LEGACY_ZONES:-all}
+  RF_COOKIE_DOMAIN: ${RF_COOKIE_DOMAIN:-}
+  RF_TLS_DOMAIN: ${RF_TLS_DOMAIN:-}
+  RF_UPDATE_URL: ${RF_UPDATE_URL:-}
+  RF_UPDATE_CHANNEL: ${RF_UPDATE_CHANNEL:-release}
+  RF_BACKUP_EVERY_HOURS: ${RF_BACKUP_EVERY_HOURS:-24}
+  RF_BACKUP_KEEP: ${RF_BACKUP_KEEP:-10}
+  RF_BACKUP_ON_START: ${RF_BACKUP_ON_START:-0}
+  RF_BACKUP_GAMEDATA: ${RF_BACKUP_GAMEDATA:-1}
+
+# The install root inside every container is /opt/rf2232, laid out exactly like
+# the bundle. Static parts (binaries, data/, scripts/) come from the image; the
+# mutable parts below live on the host under RF_DATA_DIR.
+x-rf-volumes: &rf-volumes
+  - ${RF_DATA_DIR:-./data}/settings:/opt/rf2232/settings
+  - ${RF_DATA_DIR:-./data}/db:/opt/rf2232/db
+  - ${RF_DATA_DIR:-./data}/logs:/opt/rf2232/logs
+  - ${RF_DATA_DIR:-./data}/backups:/opt/rf2232/backups
+  - ${RF_DATA_DIR:-./data}/webassets:/opt/rf2232/webassets
+  - ${RF_DATA_DIR:-./data}/client:/opt/rf2232/client
+  - ${RF_DATA_DIR:-./data}/custom:/opt/rf2232/custom
+
+services:
+  mysql:
+    logging: *logging
+    image: ${RF_MYSQL_IMAGE:-mysql:8.4}
+    profiles: [mysql]
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      MYSQL_ROOT_PASSWORD: ${RF_DB_ROOT_PASSWORD:-CHANGEME_ROOT}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  # One-shot: settings.cfg from env, stock content, launcher files, MySQL schema.
+  init:
+    logging: *logging
+    image: ${RF_IMAGE_PREFIX:-rf2232}-tools:${RF_IMAGE_TAG:-0.7.0}
+    build: { <<: *build, target: tools }
+    command: ["init"]
+    init: true
+    user: "0:0"
+    environment: *rf-env
+    volumes:
+      - ${RF_DATA_DIR:-./data}/settings:/opt/rf2232/settings
+      - ${RF_DATA_DIR:-./data}/db:/opt/rf2232/db
+      - ${RF_DATA_DIR:-./data}/logs:/opt/rf2232/logs
+      - ${RF_DATA_DIR:-./data}/backups:/opt/rf2232/backups
+      - ${RF_DATA_DIR:-./data}/webassets:/opt/rf2232/webassets
+      - ${RF_DATA_DIR:-./data}/client:/opt/rf2232/client
+      - ${RF_DATA_DIR:-./data}/custom:/opt/rf2232/custom
+      - ${RF_CLIENT_SRC:-${RF_BUNDLE_DIR:-../rf2232-v0.6.0}/client}:/bundle-client:ro
+    depends_on:
+      mysql: { condition: service_healthy, required: false }
+
+  gameserver:
+    logging: *logging
+    image: ${RF_IMAGE_PREFIX:-rf2232}-gameserver:${RF_IMAGE_TAG:-0.7.0}
+    build: { <<: *build, target: gameserver }
+    restart: unless-stopped
+    user: "${RF_UID:-1000}:${RF_GID:-1000}"
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes: *rf-volumes
+    # The webserver shares this container's network namespace (it reads live
+    # stats from 127.0.0.1:29913), so ITS ports are published here too.
+    ports:
+      - "${RF_BIND_ADDR:-0.0.0.0}:${RF_SERVICE_PORT:-27800}:${RF_SERVICE_PORT:-27800}"
+      # The launcher port is always SERVICE_PORT + 1 (rfctl sets RF_LAUNCHER_PORT).
+      - "${RF_BIND_ADDR:-0.0.0.0}:${RF_LAUNCHER_PORT:-27801}:${RF_LAUNCHER_PORT:-27801}"
+      - "${RF_BIND_ADDR:-0.0.0.0}:${RF_WEB_PORT:-8080}:8080"
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"   # lets the non-root webserver bind 80/443 (TLS mode)
+    stop_grace_period: 45s
+    depends_on:
+      init: { condition: service_completed_successfully }
+
+  webserver:
+    logging: *logging
+    image: ${RF_IMAGE_PREFIX:-rf2232}-webserver:${RF_IMAGE_TAG:-0.7.0}
+    build: { <<: *build, target: webserver }
+    restart: unless-stopped
+    user: "${RF_UID:-1000}:${RF_GID:-1000}"
+    network_mode: "service:gameserver"
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes: *rf-volumes
+    stop_grace_period: 30s
+    depends_on:
+      gameserver: { condition: service_started, restart: true }
+
+  backup:
+    logging: *logging
+    image: ${RF_IMAGE_PREFIX:-rf2232}-tools:${RF_IMAGE_TAG:-0.7.0}
+    command: ["backup-loop"]
+    init: true
+    restart: unless-stopped
+    user: "0:0"
+    environment: *rf-env
+    volumes: *rf-volumes
+    depends_on:
+      init: { condition: service_completed_successfully }
+
+volumes:
+  mysql-data:
