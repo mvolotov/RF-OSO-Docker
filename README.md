@@ -1,14 +1,15 @@
 # RF Online: Golden Age (rf2232) in Docker
 
-This folder runs the GoMMO rf2232 server bundle (gameserver and website) on Linux with
-Docker. You configure everything in `.env`. You run and manage it with `./rfctl`.
+This project runs the GoMMO rf2232 server bundle (gameserver and website) on Linux with
+Docker. You may be configure everything in `.env` and run/manage it with `./rfctl`.
 
+Example project structure
 ```
 RFOnline_GoMMO/
-├── rf2232-v0.6.0/          the unpacked server bundle (RF_BUNDLE_DIR), not modified
+├── rf2232-v0.7.0/          the unpacked server bundle (RF_BUNDLE_DIR), not modified
 └── docker/
     ├── rfctl               management script (start here)
-    ├── .env.example        every setting, documented; copied to .env on first run
+    ├── .env.example        every setting; copied to .env on first run
     ├── docker-compose.yml  services: mysql (optional), init, gameserver, webserver, backup
     ├── docker-compose.tls.yml  HTTPS overlay (added automatically when RF_TLS_DOMAIN is set)
     ├── Dockerfile          builds the images (targets: gameserver, webserver, tools)

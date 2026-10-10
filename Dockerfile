@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
 # RF Online: Golden Age (rf2232) - container images.
+# Docker packaging by Mikhail Volotov <asteriagame@gmail.com>
 #
 # One Dockerfile, three targets:
 #   gameserver  scratch + the static gameserver binary + data/ and scripts/
@@ -14,6 +15,7 @@
 # and your live databases never end up in an image.
 
 ARG ALPINE_VERSION=3.20
+ARG AUTHOR="Mikhail Volotov <asteriagame@gmail.com>"
 
 # ---------------------------------------------------------------------------
 # Minimal root filesystem for the scratch images: CA roots (Let's Encrypt, the
@@ -30,6 +32,10 @@ RUN apk add --no-cache ca-certificates tzdata \
 
 # ---------------------------------------------------------------------------
 FROM scratch AS gameserver
+ARG AUTHOR
+LABEL org.opencontainers.image.authors="${AUTHOR}" \
+      org.opencontainers.image.title="RF Online rf2232 gameserver" \
+      org.opencontainers.image.description="Docker packaging of the GoMMO rf2232 server bundle (https://oldschoolops.com)"
 COPY --from=rootfs /out/ /
 COPY --from=bundle --chmod=0755 server/linux/gameserver /opt/rf2232/server/linux/gameserver
 COPY --from=bundle data/    /opt/rf2232/data/
@@ -44,6 +50,10 @@ ENTRYPOINT ["/opt/rf2232/server/linux/gameserver"]
 
 # ---------------------------------------------------------------------------
 FROM scratch AS webserver
+ARG AUTHOR
+LABEL org.opencontainers.image.authors="${AUTHOR}" \
+      org.opencontainers.image.title="RF Online rf2232 webserver" \
+      org.opencontainers.image.description="Docker packaging of the GoMMO rf2232 server bundle (https://oldschoolops.com)"
 COPY --from=rootfs /out/ /
 COPY --from=bundle --chmod=0755 server/linux/webserver /opt/rf2232/server/linux/webserver
 ENV TZ=UTC HOME=/tmp
@@ -70,6 +80,10 @@ COPY --from=bundle db/gamedata_rf2232.db /seed/gamedata_rf2232.db
 RUN gzip -6 /seed/gamedata_rf2232.db
 
 FROM alpine:${ALPINE_VERSION} AS tools
+ARG AUTHOR
+LABEL org.opencontainers.image.authors="${AUTHOR}" \
+      org.opencontainers.image.title="RF Online rf2232 tools" \
+      org.opencontainers.image.description="Docker packaging of the GoMMO rf2232 server bundle (https://oldschoolops.com)"
 RUN apk add --no-cache bash coreutils findutils gzip tzdata ca-certificates \
         sqlite libssl3 libcrypto3 zlib ncurses-libs libstdc++ libgcc
 COPY --from=mariadb-client /out/ /
